@@ -37,7 +37,8 @@
     [com.walmartlabs.lacinia.pedestal.spec :as spec]
     [com.walmartlabs.lacinia.pedestal.interceptors :as interceptors])
   (:import
-    (org.eclipse.jetty.websocket.api UpgradeResponse UpgradeRequest)))
+    (org.eclipse.jetty.websocket.api UpgradeResponse
+                                     UpgradeRequest)))
 
 (when (-> *clojure-version* :minor (< 9))
   (require '[clojure.future :refer [pos-int?]]))
@@ -56,24 +57,6 @@
   puts them into the output-ch."
   [input-ch output-ch]
   (xform-channel input-ch output-ch cheshire/generate-string))
-
-(defn ^:private ws-parse-loop
-  "Parses text messages sent from the client into Clojure data with keyword keys,
-  which is passed along to the output-ch.
-
-  Parse errors are converted into connection_error messages sent to the response-ch."
-  [input-ch output-ch response-data-ch]
-  (go-loop []
-    (when-some [text (<! input-ch)]
-      (when-some [parsed (try
-                           (cheshire/parse-string text true)
-                           (catch Throwable t
-                             (log/debug :event ::malformed-text :message text)
-                             (>! response-data-ch
-                                 {:type :connection_error
-                                  :payload (util/as-error-map t)})))]
-        (>! output-ch parsed))
-      (recur))))
 
 (defn ^:private execute-query-interceptors
   "Executes the interceptor chain for an operation, and returns
@@ -102,77 +85,204 @@
     ;; Return a shutdown channel that the CSP can close to shutdown the subscription
     shutdown-ch))
 
-(defn ^:private connection-loop
-  "A loop started for each connection."
-  [keep-alive-ms ws-data-ch response-data-ch context]
-  (let [cleanup-ch (chan 1)]
-    ;; Keep track of subscriptions by (client-supplied) unique id.
-    ;; The value is a shutdown channel that, when closed, triggers
-    ;; a cleanup of the subscription.
-    (go-loop [connection-state {:subs {} :connection-params nil}]
-      (alt!
-        cleanup-ch
-        ([id]
-         (log/debug :event ::cleanup-ch :id id)
-         (recur (update connection-state :subs dissoc id)))
+(defprotocol Ws-Sub-Protocol
+  (sub-protocol-name [self]
+    "The name of sub-protocol.")
+  (connection-loop [self session keep-alive-ms ws-data-ch response-data-ch context]
+    "A loop started for each connection.")
+  (handle-parse-error [self session t response-data-ch]
+    "Handle a json parse error.")
+  (->data-message [self id response]
+    "Converter for `data` type message.")
+  (->complete-message [self id]
+    "Converter for `complete` type message.")
+  (->error-message [self id payload]
+    "Converter for `error` type message."))
 
-        ;; TODO: Maybe only after connection_init?
-        (async/timeout keep-alive-ms)
-        (do
-          (log/debug :event ::timeout)
-          (>! response-data-ch {:type :ka})
-          (recur connection-state))
+(def ^:private graphql-ws
+  "Server side implementation for old `graphql-ws` sub-protocol.
+  specified by [subscriptions-transport-ws](https://github.com/apollographql/subscriptions-transport-ws/blob/v0.11.0/PROTOCOL.md)"
+  (reify Ws-Sub-Protocol
+    (sub-protocol-name [_] "graphql-ws")
+    (connection-loop [_ _ keep-alive-ms ws-data-ch response-data-ch context]
+      (let [cleanup-ch (chan 1)]
+        ;; Keep track of subscriptions by (client-supplied) unique id.
+        ;; The value is a shutdown channel that, when closed, triggers
+        ;; a cleanup of the subscription.
+        (go-loop [connection-state {:subs {} :connection-params nil}]
+          (alt!
+            cleanup-ch
+            ([id]
+             (log/debug :event ::cleanup-ch :id id)
+             (recur (update connection-state :subs dissoc id)))
 
-        ws-data-ch
-        ([data]
-         (if (nil? data)
-            ;; When the client closes the connection, any running subscriptions need to
-            ;; shutdown and cleanup.
-           (do
-             (log/debug :event ::client-close)
-             (run! close! (-> connection-state :subs vals)))
-            ;; Otherwise it's a message from the client to be acted upon.
-           (let [{:keys [id payload type]} data]
-             (case type
-               "connection_init"
-               (when (>! response-data-ch {:type :connection_ack})
-                 (recur (assoc connection-state :connection-params payload)))
+            ;; TODO: Maybe only after connection_init?
+            (async/timeout keep-alive-ms)
+            (do
+              (log/debug :event ::timeout)
+              (>! response-data-ch {:type :ka})
+              (recur connection-state))
 
-               ;; TODO: Track state, don't allow start, etc. until after connection_init
-
-               "start"
-               (if (contains? (:subs connection-state) id)
-                 (do
-                   (log/debug :event ::ignoring-duplicate :id id)
-                   (recur connection-state))
-                 (do
-                   (log/debug :event ::start :id id)
-                   (let [merged-context (assoc context :connection-params (:connection-params connection-state))
-                         sub-shutdown-ch (execute-query-interceptors id payload response-data-ch cleanup-ch merged-context)]
-                     (recur (assoc-in connection-state [:subs id] sub-shutdown-ch)))))
-
-               "stop"
+            ws-data-ch
+            ([data]
+             (if (nil? data)
+               ;; When the client closes the connection, any running subscriptions need to
+               ;; shutdown and cleanup.
                (do
-                 (log/debug :event ::stop :id id)
-                 (when-some [sub-shutdown-ch (get-in connection-state [:subs id])]
-                   (close! sub-shutdown-ch))
-                 (recur connection-state))
+                 (log/debug :event ::client-close)
+                 (run! close! (-> connection-state :subs vals)))
+               ;; Otherwise it's a message from the client to be acted upon.
+               (let [{:keys [id payload type]} data]
+                 (case type
+                   "connection_init"
+                   (when (>! response-data-ch {:type :connection_ack})
+                     (recur (assoc connection-state :connection-params payload)))
 
-               "connection_terminate"
+                   ;; TODO: Track state, don't allow start, etc. until after connection_init
+
+                   "start"
+                   (if (contains? (:subs connection-state) id)
+                     (do
+                       (log/debug :event ::ignoring-duplicate :id id)
+                       (recur connection-state))
+                     (do
+                       (log/debug :event ::start :id id)
+                       (let [merged-context (assoc context :connection-params (:connection-params connection-state))
+                             sub-shutdown-ch (execute-query-interceptors id payload response-data-ch cleanup-ch merged-context)]
+                         (recur (assoc-in connection-state [:subs id] sub-shutdown-ch)))))
+
+                   "stop"
+                   (do
+                     (log/debug :event ::stop :id id)
+                     (when-some [sub-shutdown-ch (get-in connection-state [:subs id])]
+                       (close! sub-shutdown-ch))
+                     (recur connection-state))
+
+                   "connection_terminate"
+                   (do
+                     (log/debug :event ::terminate)
+                     (run! close! (-> connection-state :subs vals))
+                     ;; This shuts down the connection entirely.
+                     (close! response-data-ch))
+
+                   ;; Not recognized!
+                   (let [response (cond-> {:type :error
+                                           :payload {:message "Unrecognized message type."
+                                                     :type type}}
+                                          id (assoc :id id))]
+                     (log/debug :event ::unknown-type :type type)
+                     (>! response-data-ch response)
+                     (recur connection-state))))))))))
+    (handle-parse-error [_ _ t response-data-ch]
+      (put! response-data-ch {:type :connection_error
+                              :payload (util/as-error-map t)}))
+    (->data-message [_ id response] {:type :data
+                                     :id id
+                                     :payload response})
+    (->complete-message [_ id] {:type :complete
+                                :id id})
+    (->error-message [_ id payload] {:type :error
+                                     :id id
+                                     :payload payload})))
+
+(def ^:private graphql-transport-ws
+  "Server side implementation for `graphql-transport-ws` sub-protocol.
+  specified by [graphql-ws](https://github.com/enisdenjo/graphql-ws/blob/v5.7.0/PROTOCOL.md)"
+  (reify Ws-Sub-Protocol
+    (sub-protocol-name [_] "graphql-transport-ws")
+    (connection-loop [self session _ ws-data-ch response-data-ch context]
+      (let [cleanup-ch (chan 1)]
+        ;; Keep track of subscriptions by (client-supplied) unique id.
+        ;; The value is a shutdown channel that, when closed, triggers
+        ;; a cleanup of the subscription.
+        (go-loop [connection-state {:subs {} :connection-params nil :initialized? false}]
+          (alt!
+            cleanup-ch
+            ([id]
+             (log/debug :event ::cleanup-ch :id id)
+             (recur (update connection-state :subs dissoc id)))
+
+            ws-data-ch
+            ([data]
+             (if (nil? data)
+               ;; When the client closes the connection, any running subscriptions need to
+               ;; shutdown and cleanup.
                (do
-                 (log/debug :event ::terminate)
-                 (run! close! (-> connection-state :subs vals))
-                  ;; This shuts down the connection entirely.
-                 (close! response-data-ch))
+                 (log/debug :event ::client-close)
+                 (run! close! (-> connection-state :subs vals)))
+               ;; Otherwise it's a message from the client to be acted upon.
+               (let [{:keys [id payload type]} data]
+                 (case type
+                   "connection_init"
+                   (if (:initialized? connection-state)
+                     (do
+                       (log/debug :event ::error-too-many-init)
+                       (run! close! (-> connection-state :subs vals))
+                       (.close session 4429 "Too many initialisation requests."))
+                     (when (>! response-data-ch {:type :connection_ack})
+                       (recur (assoc connection-state :connection-params payload :initialized? true))))
 
-               ;; Not recognized!
-               (let [response (cond-> {:type :error
-                                       :payload {:message "Unrecognized message type."
-                                                 :type type}}
-                                id (assoc :id id))]
-                 (log/debug :event ::unknown-type :type type)
-                 (>! response-data-ch response)
-                 (recur connection-state))))))))))
+                   "ping"
+                   (when (>! response-data-ch {:type :pong})
+                     (recur connection-state))
+
+                   "pong"
+                   ;; Accept but ignore pong message
+                   (recur connection-state)
+
+                   ;; TODO: Track state, don't allow start, etc. until after connection_init
+
+                   "subscribe"
+                   (if (contains? (:subs connection-state) id)
+                     (do
+                       (log/debug :event ::error-duplicate-id :id id)
+                       (run! close! (-> connection-state :subs vals))
+                       (.close session 4409 (str "Subscriber for " id " already exists")))
+                     (do
+                       (log/debug :event ::start :id id)
+                       (let [merged-context (assoc context :connection-params (:connection-params connection-state))
+                             sub-shutdown-ch (execute-query-interceptors id payload response-data-ch cleanup-ch merged-context)]
+                         (recur (assoc-in connection-state [:subs id] sub-shutdown-ch)))))
+
+                   "complete"
+                   (do
+                     (log/debug :event ::stop :id id)
+                     (when-some [sub-shutdown-ch (get-in connection-state [:subs id])]
+                       (close! sub-shutdown-ch))
+                     (recur connection-state))
+
+                   ;; Not recognized!
+                   (do
+                     (log/debug :event ::unknown-type :type type)
+                     (run! close! (-> connection-state :subs vals))
+                     (.close session 4400 "Unrecognized message type."))))))))))
+    (handle-parse-error [_ session t response-data-ch]
+      (.close session 4400 "Invalid JSON.")
+      (close! response-data-ch))
+    (->data-message [_ id response] {:type :next
+                                     :id id
+                                     :payload response})
+    (->complete-message [_ id] {:type :complete
+                                :id id})
+    (->error-message [_ id payload] {:type :error
+                                     :id id
+                                     :payload payload})))
+
+(defn ^:private ws-parse-loop
+  "Parses text messages sent from the client into Clojure data with keyword keys,
+  which is passed along to the output-ch.
+
+  Parse errors are converted into connection_error messages sent to the response-ch."
+  [sub-protocol session input-ch output-ch response-data-ch]
+  (go-loop []
+    (when-some [text (<! input-ch)]
+      (when-some [parsed (try
+                           (cheshire/parse-string text true)
+                           (catch Throwable t
+                             (log/debug :event ::malformed-text :message text)
+                             (handle-parse-error sub-protocol session t response-data-ch)))]
+        (>! output-ch parsed))
+      (recur))))
 
 ;; We try to keep the interceptors here and in the main namespace as similar as possible, but
 ;; there are distinctions that can't be readily smoothed over.
@@ -240,12 +350,11 @@
   (interceptor
     {:name ::exception-handler
      :error (fn [context ^Throwable t]
-              (let [{:keys [id response-data-ch]} (:request context)
+              (let [{:keys [::sub-protocol]} context
+                    {:keys [id response-data-ch]} (:request context)
                     ;; Strip off the wrapper exception added by Pedestal
                     payload (construct-exception-payload (.getCause t))]
-                (put! response-data-ch {:type :error
-                                        :id id
-                                        :payload payload})
+                (put! response-data-ch (->error-message sub-protocol id payload))
                 (close! response-data-ch)))}))
 
 (def send-operation-response-interceptor
@@ -257,12 +366,10 @@
     {:name ::send-operation-response
      :leave (fn [context]
               (when-let [response (:response context)]
-                (let [{:keys [id response-data-ch]} (:request context)]
-                  (put! response-data-ch {:type :data
-                                          :id id
-                                          :payload response})
-                  (put! response-data-ch {:type :complete
-                                          :id id})
+                (let [sub-protocol (::sub-protocol context)
+                      {:keys [id response-data-ch]} (:request context)]
+                  (put! response-data-ch (->data-message sub-protocol id response))
+                  (put! response-data-ch (->complete-message sub-protocol id))
                   (close! response-data-ch)))
               context)}))
 
@@ -329,7 +436,7 @@
 
 (defn ^:private execute-subscription
   [context parsed-query]
-  (let [{:keys [::values-chan-fn request]} context
+  (let [{:keys [::sub-protocol ::values-chan-fn request]} context
         source-stream-ch (values-chan-fn)
         {:keys [id shutdown-ch response-data-ch]} request
         source-stream (fn accept-value [value]
@@ -379,9 +486,7 @@
                  executor/execute-query
                  (resolve/on-deliver! (fn [response]
                                         (put! response-data-ch
-                                              {:type :data
-                                               :id id
-                                               :payload response})
+                                              (->data-message sub-protocol id response))
                                         (let [new-count (swap! *execution-count dec)]
                                           (when (and @*shutting-down?
                                                      (zero? new-count))
@@ -397,13 +502,13 @@
          (recur))
 
         ;; This is a clean shutdown from a streamer that signaled (via passing a nil)
-        ;; that the subscription is exhausted.  response-data-ch is only closed
+        ;; that the subscription is exhausted. response-data-ch is only closed
         ;; after any currently executing queries have first put their
         ;; responses on it.
         streamer-shutdown-ch
         (do
-          (>! response-data-ch {:type :complete
-                                :id id})
+          (log/debug :event ::completed :id id)
+          (>! response-data-ch (->complete-message sub-protocol id))
           (close! response-data-ch)
           (cleanup-fn))))
 
@@ -533,6 +638,7 @@
   : The interval at which keep alive messages are sent to the client.
     Note that configuring this timeout to be at or above 30s conflicts with a default Jetty timeout
     closing websockets after 30s of idle time.
+    Note that effective only for old `graphql-ws` sub-protocol.
 
   :app-context
   : The base application context provided to Lacinia when executing a query.
@@ -579,19 +685,26 @@
     (fn [req resp _ws-map]
       (.setAcceptedSubProtocol ^UpgradeResponse resp "graphql-ws")
       (log/debug :event ::upgrade-requested)
-      (let [response-data-ch (response-chan-fn)             ; server data -> client
+      (let [sub-protocol (if (get (set (.getSubProtocols ^UpgradeRequest req)) "graphql-transport-ws")
+                           graphql-transport-ws
+                           graphql-ws)
+            _ (log/debug :event ::set-sub-protocol :name (sub-protocol-name sub-protocol))
+            _ (.setAcceptedSubProtocol ^UpgradeResponse resp (sub-protocol-name sub-protocol))
+            response-data-ch (response-chan-fn)             ; server data -> client
             ws-text-ch (chan 1)                             ; client text -> server
             ws-data-ch (chan 10)                            ; client text -> client data
-            on-close (fn [_ _]
-                       (log/debug :event ::closed)
+            on-close (fn [status-code _]
+                       (log/debug :event ::closed :status status-code)
                        (close! response-data-ch)
                        (close! ws-data-ch))
-            base-context' (init-context base-context req resp)
-            on-connect (fn [_session send-ch]
+            base-context' (-> base-context
+                              (init-context req resp)
+                              (assoc ::sub-protocol sub-protocol))
+            on-connect (fn [session send-ch]
                          (log/debug :event ::connected)
                          (response-encode-loop response-data-ch send-ch)
-                         (ws-parse-loop ws-text-ch ws-data-ch response-data-ch)
-                         (connection-loop keep-alive-ms ws-data-ch response-data-ch base-context'))]
+                         (ws-parse-loop sub-protocol session ws-text-ch ws-data-ch response-data-ch)
+                         (connection-loop sub-protocol session keep-alive-ms ws-data-ch response-data-ch base-context'))]
         (ws/make-ws-listener
           {:on-connect (ws/start-ws-connection on-connect send-buffer-or-n)
            :on-text #(put! ws-text-ch %)
